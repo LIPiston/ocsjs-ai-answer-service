@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制所有文件到容器
 COPY . .
 
-# 创建日志目录
-RUN mkdir -p logs
+# 创建日志目录与知识库挂载点
+RUN mkdir -p logs knowledge
 
 # 暴露端口
 EXPOSE 5000

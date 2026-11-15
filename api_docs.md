@@ -39,6 +39,75 @@ AI题库服务是一个基于OpenAI API的问题解答服务，专为[OCS (Onlin
 }
 ```
 
+### 知识库状态接口
+**URL**: `/api/kb/status`
+**方法**: `GET`
+
+```json
+{
+  "enabled": true,
+  "ready": true,
+  "kb_dir": "/app/knowledge",
+  "index_path": "/app/knowledge/.index/kb.npz",
+  "chunks": 1280,
+  "model": "BAAI/bge-m3",
+  "built_at": 1794700000.0,
+  "top_k": 5,
+  "min_score": 0.35,
+  "answer_threshold": 0.72,
+  "error": ""
+}
+```
+
+### 重建知识库接口
+**URL**: `/api/kb/rebuild`
+**方法**: `POST`（需 token）
+
+重新扫描 `KB_DIR`，切块并调用 bge-m3 重新向量化，写回索引文件。不重启容器即可生效。
+
+```json
+{"success": true, "chunks": 1280, "dim": 1024, "model": "BAAI/bge-m3", "elapsed_seconds": 42.3}
+```
+
+### 知识库检索接口
+**URL**: `/api/kb/search`
+**方法**: `GET` 或 `POST`（需 token）
+
+| 参数名 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| q      | string | 是 | 查询内容（也可用 title） |
+| top_k  | int | 否 | 返回条数，默认取配置 |
+
+```json
+{
+  "success": true,
+  "query": "中国的首都是哪个城市？",
+  "mode": "kb",
+  "hits": [
+    {"score": 0.91, "cosine": 0.88, "kind": "qa", "source": "qa.jsonl",
+     "heading": "", "text": "问：...
+答：北京", "answer": "北京", "question": "..."}
+  ]
+}
+```
+
+`hits[].score` 是余弦分加字面重合加权后的综合分，用来对照 `KB_MIN_SCORE` / `KB_ANSWER_THRESHOLD` 调参。
+
+### 答题响应的 kb 字段
+
+`/api/search` 在启用知识库时，成功响应会多一个可选的 `kb` 字段，原有 `code` / `question` / `answer` 不变：
+
+```json
+{"code": 1, "question": "...", "answer": "北京",
+ "kb": {"mode": "kb", "source": "qa.jsonl", "score": 0.91}}
+```
+
+`mode` 取值：
+
+- `kb`：命中问答型条目，答案直接来自知识库，没有调用大模型
+- `rag`：检索到相关资料，交给大模型作答（`sources` 为前 3 个来源文件）
+- `none` / 无该字段：纯大模型直答
+
 ### 健康检查接口
 
 **URL**: `/api/health`

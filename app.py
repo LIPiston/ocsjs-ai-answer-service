@@ -16,6 +16,8 @@ from datetime import datetime
 
 from config import Config
 from utils import SimpleCache, format_answer_for_ocs, parse_question_and_options, extract_answer
+from embedder import Embedder
+from kb import KnowledgeBase
 
 # 配置日志
 logging.basicConfig(
@@ -46,6 +48,46 @@ client = openai.OpenAI(
 qa_records = []
 MAX_RECORDS = 100  # 最多保存100条记录
 start_time = time.time()
+
+# ---------- 知识库（可选，KB_ENABLED） ----------
+kb = None
+if Config.KB_ENABLED:
+    _embedder = Embedder(
+        api_key=Config.EMBEDDING_API_KEY,
+        base_url=Config.EMBEDDING_API_BASE,
+        model=Config.EMBEDDING_MODEL,
+        batch_size=Config.EMBEDDING_BATCH_SIZE,
+        timeout=Config.EMBEDDING_TIMEOUT,
+        dimensions=int(Config.EMBEDDING_DIMENSIONS) if Config.EMBEDDING_DIMENSIONS else None,
+    )
+    kb = KnowledgeBase(
+        kb_dir=Config.KB_DIR,
+        index_path=Config.KB_INDEX_PATH,
+        embedder=_embedder,
+        top_k=Config.KB_TOP_K,
+        min_score=Config.KB_MIN_SCORE,
+        answer_threshold=Config.KB_ANSWER_THRESHOLD,
+        keyword_weight=Config.KB_KEYWORD_WEIGHT,
+        chunk_target=Config.KB_CHUNK_TARGET,
+    )
+    logger.info(f"知识库已启用: dir={Config.KB_DIR} model={Config.EMBEDDING_MODEL}")
+
+    if Config.KB_INDEX_AUTO:
+        import threading as _threading
+
+        def _auto_index():
+            try:
+                if kb.ready():
+                    st = kb.status()
+                    logger.info(f"知识库索引已加载: {st['chunks']} 块 ({st['model']})")
+                else:
+                    logger.info("知识库索引缺失，后台开始建库…")
+                    result = kb.rebuild()
+                    logger.info(f"后台建库结果: {result}")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"后台建库失败（服务继续以纯 LLM 模式运行）: {exc}", exc_info=True)
+
+        _threading.Thread(target=_auto_index, name='kb-autoindex', daemon=True).start()
 
 def verify_access_token(request):
     """验证访问令牌（如果配置了的话）"""
@@ -117,17 +159,58 @@ def search():
             if cached_answer:
                 logger.info(f"从缓存获取答案 (耗时: {time.time() - start_time:.2f}秒)")
                 return jsonify(format_answer_for_ocs(question, cached_answer))
-        
+
+        # 先查知识库（可选）：命中问答条目直接作答，否则把检索到的资料交给 LLM
+        kb_result = {'mode': 'none', 'answer': None, 'context': '', 'hits': []}
+        if kb is not None:
+            try:
+                kb_result = kb.lookup(question, question_type, options)
+            except Exception as exc:  # noqa: BLE001 - 知识库故障不能拖垮答题
+                logger.warning(f"知识库检索异常，降级为纯 LLM: {exc}", exc_info=True)
+
+        if kb_result['mode'] == 'kb' and kb_result['answer']:
+            answer = extract_answer(kb_result['answer'], question_type)
+            source = kb_result['hits'][0] if kb_result['hits'] else {}
+            logger.info(
+                f"知识库命中直接作答 (score={source.get('score')}, source={source.get('source')}) "
+                f"耗时 {time.time() - start_time:.2f}s"
+            )
+            if Config.ENABLE_CACHE:
+                cache.set(question, answer, question_type, options)
+            qa_records.append({
+                'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'timestamp': datetime.now().isoformat(),
+                'question': question,
+                'type': question_type,
+                'options': options,
+                'answer': answer,
+                'source': f"kb:{source.get('source', '')}",
+            })
+            if len(qa_records) > MAX_RECORDS:
+                qa_records.pop(0)
+            resp = format_answer_for_ocs(question, answer)
+            resp['kb'] = {'mode': 'kb', 'source': source.get('source', ''), 'score': source.get('score')}
+            return jsonify(resp)
+
         # 构建发送给OpenAI的提示
         prompt = parse_question_and_options(question, options, question_type)
-        
+
+        system_prompt = "你是一个专业的考试答题助手。请直接回答答案，不要解释。选择题只回答选项的内容(如：地球)；多选题用#号分隔答案,只回答选项的内容(如中国#世界#地球)；判断题只回答: 正确/对/true/√ 或 错误/错/false/×；填空题直接给出答案。"
+        if kb_result['context']:
+            context = kb_result['context'][:Config.KB_CONTEXT_MAX_CHARS]
+            system_prompt += (
+                "\n\n下面是从题库知识库检索到的资料，若资料与题目相关，请优先依据资料作答；"
+                "资料与题目无关时忽略它，凭你的知识作答。不要在答案中引用资料原文或标注来源。\n"
+                f"----\n{context}\n----"
+            )
+
         # 调用OpenAI API
         response = client.chat.completions.create(
             model=Config.OPENAI_MODEL,
             temperature=Config.TEMPERATURE,
             max_tokens=Config.MAX_TOKENS,
             messages=[
-                {"role": "system", "content": "你是一个专业的考试答题助手。请直接回答答案，不要解释。选择题只回答选项的内容(如：地球)；多选题用#号分隔答案,只回答选项的内容(如中国#世界#地球)；判断题只回答: 正确/对/true/√ 或 错误/错/false/×；填空题直接给出答案。"},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -150,17 +233,25 @@ def search():
             'question': question,
             'type': question_type,
             'options': options,
-            'answer': processed_answer
+            'answer': processed_answer,
+            'source': 'kb:rag' if kb_result['mode'] == 'rag' else 'llm',
         })
         if len(qa_records) > MAX_RECORDS:
             qa_records.pop(0)
         
         # 记录处理时间
         process_time = time.time() - start_time
-        logger.info(f"问题处理完成 (耗时: {process_time:.2f}秒)")
+        logger.info(f"问题处理完成 (耗时: {process_time:.2f}秒, 知识库={kb_result['mode']})")
         
         # 返回符合OCS格式的响应
-        return jsonify(format_answer_for_ocs(question, processed_answer))
+        payload = format_answer_for_ocs(question, processed_answer)
+        if kb_result['mode'] != 'none':
+            payload['kb'] = {
+                'mode': kb_result['mode'],
+                'sources': [h.get('source') for h in kb_result['hits'][:3]],
+                'top_score': kb_result['hits'][0].get('score') if kb_result['hits'] else None,
+            }
+        return jsonify(payload)
     
     except Exception as e:
         # 记录异常
@@ -175,12 +266,68 @@ def search():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
-    return jsonify({
+    payload = {
         'status': 'ok',
         'message': 'AI题库服务运行正常',
-        'version': '1.0.0',
+        'version': '1.2.0',
         'cache_enabled': Config.ENABLE_CACHE,
-        'model': Config.OPENAI_MODEL
+        'model': Config.OPENAI_MODEL,
+        'kb_enabled': kb is not None,
+    }
+    if kb is not None:
+        status = kb.status()
+        payload['kb_ready'] = status['ready']
+        payload['kb_chunks'] = status['chunks']
+        payload['embedding_model'] = status['model'] or Config.EMBEDDING_MODEL
+    return jsonify(payload)
+
+
+@app.route('/api/kb/status', methods=['GET'])
+def kb_status():
+    """知识库状态"""
+    if kb is None:
+        return jsonify({'enabled': False, 'message': '知识库未启用（KB_ENABLED=false）'})
+    return jsonify(kb.status())
+
+
+@app.route('/api/kb/rebuild', methods=['POST'])
+def kb_rebuild():
+    """重建知识库索引：重新扫描 KB_DIR，切块并调用 bge-m3 重新向量化"""
+    if not verify_access_token(request):
+        return jsonify({'success': False, 'message': '无效的访问令牌'}), 403
+    if kb is None:
+        return jsonify({'success': False, 'message': '知识库未启用（KB_ENABLED=false）'}), 400
+    result = kb.rebuild()
+    return jsonify(result), (200 if result.get('success') else 500)
+
+
+@app.route('/api/kb/search', methods=['GET', 'POST'])
+def kb_search():
+    """知识库检索（调试用）：返回命中的资料块与分数"""
+    if not verify_access_token(request):
+        return jsonify({'success': False, 'message': '无效的访问令牌'}), 403
+    if kb is None:
+        return jsonify({'success': False, 'message': '知识库未启用（KB_ENABLED=false）'}), 400
+    if request.method == 'GET':
+        query = request.args.get('q', '') or request.args.get('title', '')
+        top_k = request.args.get('top_k')
+    else:
+        data = request.get_json(silent=True) or {}
+        query = data.get('q', '') or data.get('title', '')
+        top_k = data.get('top_k')
+    if not query:
+        return jsonify({'success': False, 'message': '缺少查询内容 q'}), 400
+    try:
+        top_k = int(top_k) if top_k else None
+    except (TypeError, ValueError):
+        top_k = None
+    hits = kb.search(query, top_k)
+    return jsonify({
+        'success': True,
+        'query': query,
+        'hits': hits,
+        'mode': ('kb' if hits and hits[0].get('answer') and hits[0]['score'] >= Config.KB_ANSWER_THRESHOLD
+                 else ('rag' if hits else 'none')),
     })
 
 @app.route('/api/cache/clear', methods=['POST'])
@@ -216,13 +363,21 @@ def get_stats():
         }), 403
     
     stats = {
-        'version': '1.0.0',
+        'version': '1.2.0',
         'uptime': time.time() - start_time,
         'model': Config.OPENAI_MODEL,
         'cache_enabled': Config.ENABLE_CACHE,
         'cache_size': len(cache.cache) if Config.ENABLE_CACHE else 0,
         'qa_records_count': len(qa_records)
     }
+    if kb is not None:
+        status = kb.status()
+        stats['kb'] = {
+            'ready': status['ready'],
+            'chunks': status['chunks'],
+            'embedding_model': status['model'] or Config.EMBEDDING_MODEL,
+            'built_at': status['built_at'],
+        }
     
     return jsonify(stats)
 
@@ -235,14 +390,19 @@ def dashboard():
     minutes = int((uptime_seconds % 3600) // 60)
     uptime_str = f"{days}天{hours}小时{minutes}分钟"
     
+    status = kb.status() if kb is not None else None
     return render_template(
         'dashboard.html',
-        version="1.1.0",
+        version="1.2.0",
         cache_enabled=Config.ENABLE_CACHE,
         cache_size=len(cache.cache) if Config.ENABLE_CACHE else 0,
         model=Config.OPENAI_MODEL,
         uptime=uptime_str,
-        records=qa_records
+        records=qa_records,
+        kb_enabled=kb is not None,
+        kb_ready=bool(status and status['ready']),
+        kb_chunks=status['chunks'] if status else 0,
+        kb_model=(status['model'] or Config.EMBEDDING_MODEL) if status else '',
     )
 
 @app.route('/', methods=['GET'])

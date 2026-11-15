@@ -39,6 +39,14 @@
                         <p><strong>缓存数量：</strong>{{ cache_size }}条</p>
                         <p><strong>使用模型：</strong>{{ model }}</p>
                         <p><strong>运行时长：</strong>{{ uptime }}</p>
+                        <p><strong>知识库：</strong>
+                            {% if kb_enabled %}
+                                {% if kb_ready %}<span class="text-success">已就绪</span>{% else %}<span class="text-danger">未就绪</span>{% endif %}
+                                （{{ kb_chunks }} 块 · {{ kb_model }}）
+                            {% else %}
+                                <span class="text-muted">未启用</span>
+                            {% endif %}
+                        </p>
                     </div>
                 </div>
             </div>
@@ -61,6 +69,7 @@
                                         <th>问题内容</th>
                                         <th>选项</th>
                                         <th>AI答案</th>
+                                        <th>来源</th>
                                         <th>操作</th>
                                     </tr>
                                 </thead>
@@ -84,6 +93,7 @@
                                                 {{ record.answer }}
                                             </div>
                                         </td>
+                                        <td>{{ record.source or 'llm' }}</td>
                                         <td>
                                             <button class="btn btn-sm btn-info" onclick="showDetail('{{ record.question|tojson|safe }}', '{{ record.options|tojson|safe }}', '{{ record.answer|tojson|safe }}')">详情</button>
                                         </td>
