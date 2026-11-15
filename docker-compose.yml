@@ -9,12 +9,15 @@ services:
       - "5000:5000"
     volumes:
       - ./logs:/app/logs
+      # 知识库文件放宿主机 ./knowledge，增量加文件后 POST /api/kb/rebuild 即可
+      - ./knowledge:/app/knowledge
     env_file:
       - .env
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      # 镜像里没有 curl，用 python 自检，否则 healthcheck 永远 unhealthy
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=5).status == 200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 10s
