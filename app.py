@@ -169,7 +169,7 @@ def search():
                 logger.warning(f"知识库检索异常，降级为纯 LLM: {exc}", exc_info=True)
 
         if kb_result['mode'] == 'kb' and kb_result['answer']:
-            answer = extract_answer(kb_result['answer'], question_type)
+            answer = extract_answer(kb_result['answer'], question_type, options)
             source = kb_result['hits'][0] if kb_result['hits'] else {}
             logger.info(
                 f"知识库命中直接作答 (score={source.get('score')}, source={source.get('source')}) "
@@ -199,8 +199,12 @@ def search():
         if kb_result['context']:
             context = kb_result['context'][:Config.KB_CONTEXT_MAX_CHARS]
             system_prompt += (
-                "\n\n下面是从题库知识库检索到的资料，若资料与题目相关，请优先依据资料作答；"
-                "资料与题目无关时忽略它，凭你的知识作答。不要在答案中引用资料原文或标注来源。\n"
+                "\n\n下面是从题库知识库检索到的资料。规则：\n"
+                "1. 若资料中能直接找到题目所问的事实（尤其是具体的数字、年限、比例、金额、条数），"
+                "必须严格照抄资料里的数值，不要自己推断或改写。\n"
+                "2. 资料与题目无关时忽略它，凭你的知识作答。\n"
+                "3. 答选择题时只输出选项内容本身，不要带字母前缀。\n"
+                "4. 不要在答案中引用资料原文或标注来源。\n"
                 f"----\n{context}\n----"
             )
 
@@ -219,7 +223,7 @@ def search():
         ai_answer = response.choices[0].message.content.strip()
         
         # 处理答案格式
-        processed_answer = extract_answer(ai_answer, question_type)
+        processed_answer = extract_answer(ai_answer, question_type, options)
         
         # 保存到缓存
         if Config.ENABLE_CACHE:

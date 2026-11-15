@@ -146,7 +146,7 @@ def parse_question_and_options(question: str, options: str, question_type: str) 
     return prompt
 
 
-def extract_answer(ai_response: str, question_type: str) -> str:
+def extract_answer(ai_response: str, question_type: str, options: str = '') -> str:
     """
     从AI响应中提取答案
     
@@ -170,5 +170,9 @@ def extract_answer(ai_response: str, question_type: str) -> str:
                 answer = '#'.join(options)
                 return answer
     
-    # 默认返回完整响应
-    return ai_response
+    # 按题型清洗：去选项字母、判断题归一、多选规范成 A#B#
+    try:
+        from answer_clean import clean_answer
+        return clean_answer(ai_response, question_type, options)
+    except Exception:  # noqa: BLE001 - 清洗失败不能影响答题
+        return ai_response
